@@ -3,10 +3,6 @@
 
 > [!WARNING] 이 PUB/SUB 익스텐션의 동시성과 성능은 처참하며, 에러가 많습니다.
 
-```
-make
-```
-
 #### 0. 준비 사항
 
 - arcus-memcached
