@@ -14,7 +14,9 @@ pub struct MemcachedConn {
     pub sfd: c_int,
     pub nevents: c_short,
     pub sasl_conn: *mut c_void,
+    #[cfg(feature = "sasl-dev")]
     pub sasl_started: bool,
+    #[cfg(feature = "sasl-dev")]
     pub authenticated: bool,
     pub state: STATE_FUNC,
     pub substate: BinSubstates,
@@ -88,6 +90,8 @@ pub struct MemcachedConn {
     pub suffixsize: c_int,
     pub suffixcurr: *mut *mut i8,
     pub suffixleft: c_int,
+    #[cfg(feature = "detect-long-query")]
+    pub lq_result: *mut Field,
     pub protocol: Protocol,
     pub transport: NetworkTransport,
     pub request_id: c_int,

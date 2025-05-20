@@ -133,7 +133,8 @@ extern "C" fn unsubscribe_all(cookie: *const c_void,
             match iek.get_mut(&iekey) {
                 Some(iekdata) => {
                     iekdata.waiters.remove(&ptr);
-                    if !iekdata.owner.is_none() && iekdata.owner.unwrap() == ptr {
+                    if iekdata.owner.is_none() ||
+                       (!iekdata.owner.is_none() && iekdata.owner.unwrap() == ptr) {
                         iekdata.owner = None;
                         if iekdata.waiters.is_empty() {
                             iek.remove(&iekey);
@@ -213,7 +214,7 @@ fn process_publish_command(cookie: *const c_void, iekey: String, msg: String) ->
 
 fn process_subscribe_command(cookie: *const c_void, iekey: String) -> String {
     let ptr = cookie as usize;
-    let result = "SUBSCRIBED\r\n".to_string();
+    let result = format!("{} SUCCESS\r\n", iekey);
 
     {
         let mut iek = IEK.lock().unwrap();
@@ -233,12 +234,24 @@ fn process_subscribe_command(cookie: *const c_void, iekey: String) -> String {
             Entry::Occupied(mut e) => {
                 let data = e.get_mut();
                 if data.iek_type != IEKType::PubSub {
-                    return "TYPE_MISMATCH\r\n".to_string();
+                    return format!("{} TYPE_MISMATCH\r\n", iekey);
                 }
                 data.waiters.entry(ptr)
                             .or_insert_with(HashSet::new)
                             .insert(None);
             }
+        }
+    }
+
+    {
+        let mut conn = CONN.lock().unwrap();
+        let s = match conn.entry(ptr) {
+            Entry::Vacant(e) => e.insert(HashSet::new()),
+            Entry::Occupied(e) => e.into_mut()
+        };
+
+        if !s.contains(&iekey) {
+            s.insert(iekey);
         }
     }
 
@@ -373,7 +386,7 @@ extern "C" fn accept_command(cmd_cookie: *const c_void, cookie: *mut c_void,
             return true;
         }
     } else if cmd_cookie == &raw const IEK_SUB_DESCRIPTOR as *const _ as *const c_void {
-        if argc == 2 && op.to_str().unwrap_or("") == "subscribe" {
+        if argc >= 2 && op.to_str().unwrap_or("") == "subscribe" {
             return true;
         }
     }
@@ -385,7 +398,7 @@ extern "C" fn execute_command(cmd_cookie: *const c_void, cookie: *const c_void,
     argc: c_int, argv: *mut token_t,
     response_handler: ResponseHandler) -> bool {
     let mut cur_token: usize = 1;
-    let iekey = unsafe { CStr::from_ptr((*argv.add(cur_token)).value) }.to_string_lossy().into_owned();
+    let mut iekey = unsafe { CStr::from_ptr((*argv.add(cur_token)).value) }.to_string_lossy().into_owned();
     let mut result  = "ERROR unknown command\r\n".to_string();
     cur_token += 1;
 
@@ -439,7 +452,17 @@ extern "C" fn execute_command(cmd_cookie: *const c_void, cookie: *const c_void,
                 result = process_publish_command(cookie, iekey, msg);
             },
             CMDType::Subscribe => {
-                result = process_subscribe_command(cookie, iekey);
+                result = format!("SUBSCRIBE {}\r\n", argc - 1);
+                loop {
+                    result += &process_subscribe_command(cookie, iekey.clone());
+                    if cur_token < argc as usize {
+                        iekey = unsafe { CStr::from_ptr((*argv.add(cur_token)).value) }.to_string_lossy().into_owned();
+                        cur_token += 1;
+                    } else {
+                        break;
+                    }
+                }
+                result += "END\r\n";
             },
             _ => ()
 

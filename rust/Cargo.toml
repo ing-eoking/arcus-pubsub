@@ -9,12 +9,14 @@ libc = "0.2.172"
 
 [features]
 default = ["support-bop-mget", "support-bop-smget", "jhpark-old-smget-interface",
-           "scan-command", "multi-notify-io-complete", ]
+           "scan-command", "multi-notify-io-complete"]
 support-bop-mget = []
 support-bop-smget = []
 jhpark-old-smget-interface = []
 scan-command = []
 multi-notify-io-complete = []
+sasl-dev = []
+detect-long-query = []
 
 [lib]
 crate-type = ["cdylib"]

@@ -1,0 +1,35 @@
+name: Build macOS ARM64 Binary
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:  # 수동 실행도 가능하게
+
+jobs:
+  build-macos-arm:
+    runs-on: macos-latest  # Apple Silicon (ARM64) macOS 환경
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: aarch64-apple-darwin
+          override: true
+
+      - name: Add target
+        run: rustup target add aarch64-apple-darwin
+
+      - name: Build release for macOS ARM
+        run: |
+            cd rust
+            cargo build --features="sasl-dev" --target=aarch64-apple-darwin
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: my-macos-arm-binary
+          path: rust/target/aarch64-apple-darwin/debug/libingeoking.dylib
