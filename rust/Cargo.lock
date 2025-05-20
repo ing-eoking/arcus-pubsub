@@ -115,6 +115,7 @@ dependencies = [
 name = "ingeoking"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "libevent-sys",
 ]
 
