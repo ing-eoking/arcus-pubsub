@@ -68,9 +68,9 @@ pub enum BinSubstates {
     BinReadingBopPosition,
     BinReadingBopPwg,
     BinReadingBopGbp,
-    #[cfg(any(feature = "support-bop-mget", feature = "support-bop-smget"))]
+    #[cfg(not(feature = "old"))]
     BinReadingBopPrepareNreadKeys,
-    #[cfg(any(feature = "support-bop-mget", feature = "support-bop-smget"))]
+    #[cfg(not(feature = "old"))]
     BinReadingBopNreadKeysComplete,
     BinReadingPacket,
 }

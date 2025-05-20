@@ -8,13 +8,10 @@ libevent-sys = "0.3.0"
 libc = "0.2.172"
 
 [features]
-default = ["support-bop-mget", "support-bop-smget", "jhpark-old-smget-interface",
-           "scan-command", "multi-notify-io-complete", ]
-support-bop-mget = []
-support-bop-smget = []
-jhpark-old-smget-interface = []
-scan-command = []
-multi-notify-io-complete = []
+default = ["1-14-0"]
+1-14-0 = []
+dev = []
+old = []
 
 [lib]
 crate-type = ["cdylib"]

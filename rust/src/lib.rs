@@ -30,6 +30,7 @@ enum IEKType {
 enum CMDType {
     Publish,
     Subscribe,
+    Unsubscribe,
     Lock,
     Unlock,
     Unknown
@@ -93,6 +94,13 @@ static CONN: LazyLock<Mutex<HashMap<usize, HashSet<String>>>> = LazyLock::new(||
     Mutex::new(HashMap::new())
 });
 
+macro_rules! is_lock_free {
+    ($d:expr) => {
+        $d.owner.is_none() ||
+        $d.lease_time < Instant::now()
+    };
+}
+
 struct EventMessage {
     ev: *mut event,
     message: String
@@ -133,7 +141,8 @@ extern "C" fn unsubscribe_all(cookie: *const c_void,
             match iek.get_mut(&iekey) {
                 Some(iekdata) => {
                     iekdata.waiters.remove(&ptr);
-                    if !iekdata.owner.is_none() && iekdata.owner.unwrap() == ptr {
+                    if iekdata.owner.is_none() ||
+                       (!iekdata.owner.is_none() && iekdata.owner.unwrap() == ptr) {
                         iekdata.owner = None;
                         if iekdata.waiters.is_empty() {
                             iek.remove(&iekey);
@@ -200,7 +209,7 @@ fn process_publish_command(cookie: *const c_void, iekey: String, msg: String) ->
         let mut iek = IEK.lock().unwrap();
         match iek.get_mut(&iekey) {
             Some(iekdata) => {
-                if iekdata.iek_type != IEKType::PubSub {
+                if !is_lock_free!(iekdata) && iekdata.iek_type != IEKType::PubSub {
                     return "TYPE_MISMATCH\r\n".to_string();
                 }
                 do_publish(iekdata, format!("CHANNEL {} {}", iekey, msg));
@@ -213,7 +222,7 @@ fn process_publish_command(cookie: *const c_void, iekey: String, msg: String) ->
 
 fn process_subscribe_command(cookie: *const c_void, iekey: String) -> String {
     let ptr = cookie as usize;
-    let result = "SUBSCRIBED\r\n".to_string();
+    let result = format!("{} SUCCESS\r\n", iekey);
 
     {
         let mut iek = IEK.lock().unwrap();
@@ -227,19 +236,47 @@ fn process_subscribe_command(cookie: *const c_void, iekey: String) -> String {
                     waiters: [(ptr, None)].into_iter()
                                           .map(|(k, v)| (k, HashSet::from([v])))
                                           .collect()
-
                 });
             },
             Entry::Occupied(mut e) => {
                 let data = e.get_mut();
-                if data.iek_type != IEKType::PubSub {
-                    return "TYPE_MISMATCH\r\n".to_string();
+                if !is_lock_free!(data) && data.iek_type != IEKType::PubSub {
+                    return format!("{} TYPE_MISMATCH\r\n", iekey);
                 }
                 data.waiters.entry(ptr)
                             .or_insert_with(HashSet::new)
                             .insert(None);
             }
         }
+    }
+
+    {
+        let mut conn = CONN.lock().unwrap();
+        let s = match conn.entry(ptr) {
+            Entry::Vacant(e) => e.insert(HashSet::new()),
+            Entry::Occupied(e) => e.into_mut()
+        };
+
+        if !s.contains(&iekey) {
+            s.insert(iekey);
+        }
+    }
+
+    return result;
+}
+
+fn process_unsubscribe_command(cookie: *const c_void, iekey: String) -> String {
+    let ptr = cookie as usize;
+    let mut iek = IEK.lock().unwrap();
+    let mut result = "SUCCESS\r\n".to_string();
+
+    match iek.get_mut(&iekey) {
+        Some(iekdata) => {
+            if iekdata.waiters.remove(&ptr).is_none() {
+                result = "NOT_SUBSCRIBED\r\n".to_string();
+            }
+        },
+        _ => result = "NOT_FOUND_CHANNEL\r\n".to_string()
     }
 
     return result;
@@ -319,7 +356,9 @@ fn process_unlock_command(cookie: *const c_void, iekey: String, sub_key: Option<
                 if iekdata.iek_type != IEKType::Lock {
                     return "TYPE_MISMATCH\r\n".to_string();
                 }
-                if !iekdata.owner.is_none() && iekdata.owner.unwrap() == ptr && iekdata.sub_key == sub_key {
+
+                if !is_lock_free!(iekdata) &&
+                    iekdata.owner.unwrap() == ptr && iekdata.sub_key == sub_key {
                     iekdata.owner = None;
                     if iekdata.waiters.is_empty() {
                         iek.remove(&iekey);
@@ -330,7 +369,7 @@ fn process_unlock_command(cookie: *const c_void, iekey: String, sub_key: Option<
                 } else {
                     result = "NOT_OWNED\r\n".to_string();
                 }
-            }
+            },
             None => result = "NOT_FOUND\r\n".to_string()
         }
     }
@@ -373,19 +412,19 @@ extern "C" fn accept_command(cmd_cookie: *const c_void, cookie: *mut c_void,
             return true;
         }
     } else if cmd_cookie == &raw const IEK_SUB_DESCRIPTOR as *const _ as *const c_void {
-        if argc == 2 && op.to_str().unwrap_or("") == "subscribe" {
+        if argc >= 2 && (op.to_str().unwrap_or("") == "subscribe" ||
+                         op.to_str().unwrap_or("") == "unsubscribe") {
             return true;
         }
     }
     return false;
 }
-
 #[allow(unused_variables)]
 extern "C" fn execute_command(cmd_cookie: *const c_void, cookie: *const c_void,
     argc: c_int, argv: *mut token_t,
     response_handler: ResponseHandler) -> bool {
     let mut cur_token: usize = 1;
-    let iekey = unsafe { CStr::from_ptr((*argv.add(cur_token)).value) }.to_string_lossy().into_owned();
+    let mut iekey = unsafe { CStr::from_ptr((*argv.add(cur_token)).value) }.to_string_lossy().into_owned();
     let mut result  = "ERROR unknown command\r\n".to_string();
     cur_token += 1;
 
@@ -397,7 +436,12 @@ extern "C" fn execute_command(cmd_cookie: *const c_void, cookie: *const c_void,
     } else if cmd_cookie == &raw const IEK_PUB_DESCRIPTOR as *const _ as *const c_void {
         cmd_type = CMDType::Publish;
     } else if cmd_cookie == &raw const IEK_SUB_DESCRIPTOR as *const _ as *const c_void {
-        cmd_type = CMDType::Subscribe;
+        let first_str = unsafe { CStr::from_ptr((*argv).value) }.to_string_lossy().chars().next();
+        match first_str {
+            Some('s') => cmd_type = CMDType::Subscribe,
+            Some('u') => cmd_type = CMDType::Unsubscribe,
+            _ => cmd_type = CMDType::Unknown
+        }
     }
 
 
@@ -439,7 +483,20 @@ extern "C" fn execute_command(cmd_cookie: *const c_void, cookie: *const c_void,
                 result = process_publish_command(cookie, iekey, msg);
             },
             CMDType::Subscribe => {
-                result = process_subscribe_command(cookie, iekey);
+                result = format!("SUBSCRIBE {}\r\n", argc - 1);
+                loop {
+                    result += &process_subscribe_command(cookie, iekey.clone());
+                    if cur_token < argc as usize {
+                        iekey = unsafe { CStr::from_ptr((*argv.add(cur_token)).value) }.to_string_lossy().into_owned();
+                        cur_token += 1;
+                    } else {
+                        break;
+                    }
+                }
+                result += "END\r\n";
+            },
+            CMDType::Unsubscribe => {
+                result = process_unsubscribe_command(cookie, iekey.clone())
             },
             _ => ()
 

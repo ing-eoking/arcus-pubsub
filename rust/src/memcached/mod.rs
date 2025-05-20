@@ -14,7 +14,9 @@ pub struct MemcachedConn {
     pub sfd: c_int,
     pub nevents: c_short,
     pub sasl_conn: *mut c_void,
+    #[cfg(feature = "dev")]
     pub sasl_started: bool,
+    #[cfg(feature = "dev")]
     pub authenticated: bool,
     pub state: STATE_FUNC,
     pub substate: BinSubstates,
@@ -52,9 +54,9 @@ pub struct MemcachedConn {
     pub coll_getrim: bool,
     pub coll_delete: bool,
     pub coll_drop: bool,
-    #[cfg(feature = "jhpark-old-smget-interface")]
+    #[cfg(not(feature = "old"))]
     pub coll_smgmode: c_int,
-    #[cfg(not(feature = "jhpark-old-smget-interface"))]
+    #[cfg(feature = "old")]
     pub coll_unique: bool,
     pub coll_bkrange: BkeyRange, // not ok
     pub coll_efilter: EflagFilter,
@@ -80,14 +82,16 @@ pub struct MemcachedConn {
     pub isize: c_int,
     pub icurr: *mut *mut Item,
     pub ileft: c_int,
-    #[cfg(feature = "scan-command")]
+    #[cfg(not(feature = "old"))]
     pub pcurr: *mut *mut Item,
-    #[cfg(feature = "scan-command")]
+    #[cfg(not(feature = "old"))]
     pub pleft: c_int,
     pub suffixlist: *mut *mut i8,
     pub suffixsize: c_int,
     pub suffixcurr: *mut *mut i8,
     pub suffixleft: c_int,
+    #[cfg(feature = "1-14-0")]
+    pub lq_result: *mut Field,
     pub protocol: Protocol,
     pub transport: NetworkTransport,
     pub request_id: c_int,
@@ -115,15 +119,15 @@ pub struct MemcachedConn {
     pub conn_next: *mut MemcachedConn,
     pub aiostat: ENGINE_ERROR_CODE,
     pub ewouldblock: bool,
-    #[cfg(feature = "multi-notify-io-complete")]
+    #[cfg(not(feature = "old"))]
     pub io_blocked: bool,
-    #[cfg(feature = "multi-notify-io-complete")]
+    #[cfg(not(feature = "old"))]
     pub current_io_wait: c_uint,
-    #[cfg(feature = "multi-notify-io-complete")]
+    #[cfg(not(feature = "old"))]
     pub premature_io_complete: c_uint,
-    #[cfg(not(feature = "multi-notify-io-complete"))]
+    #[cfg(feature = "old")]
     pub io_blocked: bool,
-    #[cfg(not(feature = "multi-notify-io-complete"))]
+    #[cfg(feature = "old")]
     pub premature_io_complete: bool,
 }
 
