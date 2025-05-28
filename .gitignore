@@ -1,0 +1,4 @@
+c/pubsub.c
+c/pubsub.so
+rust/target/*
+rust/Cargo.lock

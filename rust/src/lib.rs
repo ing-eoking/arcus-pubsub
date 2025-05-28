@@ -30,6 +30,7 @@ enum IEKType {
 enum CMDType {
     Publish,
     Subscribe,
+    Unsubscribe,
     Lock,
     Unlock,
     Unknown
@@ -39,6 +40,7 @@ struct IEKData {
     pub iek_type: IEKType,
     pub sub_key: Option<i32>,
     pub lease_time: Instant,
+    pub timer_ev: usize,
     pub owner: Option<usize>,
     pub waiters: HashMap<usize, HashSet<Option<i32>>>
 }
@@ -93,9 +95,10 @@ static CONN: LazyLock<Mutex<HashMap<usize, HashSet<String>>>> = LazyLock::new(||
     Mutex::new(HashMap::new())
 });
 
-struct EventMessage {
+struct EventBox {
+    cookie: usize,
     ev: *mut event,
-    message: String
+    ptr: String
 }
 
 #[allow(unused_variables)]
@@ -103,13 +106,48 @@ unsafe extern "C" fn event_resp_cb(fd: i32, _events: i16, arg: *mut c_void) {
     let mut stream =  unsafe {
         ManuallyDrop::new(TcpStream::from_raw_fd(fd))
     };
-    let ev_msg = unsafe{ &mut *(arg as *mut EventMessage) };
+    let ev_msg = unsafe{ &mut *(arg as *mut EventBox) };
 
-    if let Err(_e) = stream.write(ev_msg.message.as_bytes()) {
+    if let Err(_e) = stream.write(ev_msg.ptr.as_bytes()) {
         /* log: "Write failure" */
     }
 
     unsafe { event_free(ev_msg.ev) };
+}
+
+#[allow(unused_variables)]
+unsafe extern "C" fn event_timer_cb(fd: i32, _events: i16, arg: *mut c_void) {
+    let ev_box = unsafe{ &mut *(arg as *mut EventBox) };
+    let iekey = ev_box.ptr.clone();
+
+    {
+        let mut iek = IEK.lock().unwrap();
+        match iek.get_mut(&iekey) {
+            Some(iekdata) => {
+                iekdata.owner = None;
+                if iekdata.waiters.is_empty() {
+                    iek.remove(&iekey);
+                } else {
+                    do_publish(iekdata, format!("UNLOCKED {}", iekey));
+                }
+            },
+            None => ()
+        }
+    }
+
+    {
+        let mut conn = CONN.lock().unwrap();
+        let s = match conn.entry(ev_box.cookie) {
+            Entry::Vacant(e) => e.insert(HashSet::new()),
+            Entry::Occupied(e) => e.into_mut()
+        };
+
+        if !s.contains(&iekey) {
+            s.remove(&iekey);
+        }
+    }
+
+    unsafe { event_free(ev_box.ev) };
 }
 
 #[allow(unused_variables)]
@@ -143,7 +181,7 @@ extern "C" fn unsubscribe_all(cookie: *const c_void,
                         }
                     }
                 }
-                None => ()
+                _ => ()
             }
         }
     }
@@ -155,10 +193,16 @@ fn add_event_msg(c: usize, msg: String) -> i32 {
         let base = mconn.event.ev_base;
         let write_ev = event_new(base, mconn.sfd, EV_WRITE as c_short,
                     Some(event_resp_cb), std::ptr::null_mut());
-        let arg = Box::new(EventMessage {
+        let arg = Box::new(EventBox {
+            cookie: c,
             ev: write_ev,
-            message: msg
+            ptr: msg
         });
+
+        if write_ev == std::ptr::null_mut() {
+            /* event error */
+        }
+
         event_assign(write_ev, base, mconn.sfd,
                      EV_WRITE as c_short, Some(event_resp_cb),
                      Box::into_raw(arg) as *mut c_void);
@@ -166,6 +210,33 @@ fn add_event_msg(c: usize, msg: String) -> i32 {
         event_add(write_ev, std::ptr::null_mut());
 
         return (*mconn.thread).notify_send_fd;
+    }
+}
+
+fn update_alarm(c: usize, mut ev: *mut event, iekey: String, time: timeval) -> *mut event {
+    unsafe {
+        if ev == std::ptr::null_mut() {
+            let mconn = &*(c as *const MemcachedConn);
+            let base = mconn.event.ev_base;
+            ev = event_new(base, mconn.sfd, EV_TIMEOUT as c_short,
+                           Some(event_timer_cb), std::ptr::null_mut());
+            let arg = Box::new(EventBox {
+                cookie: c,
+                ev: ev,
+                ptr: iekey,
+            });
+
+            if ev == std::ptr::null_mut() {
+                /* event error */
+            }
+
+            event_assign(ev, base, mconn.sfd,
+                         EV_TIMEOUT as c_short, Some(event_timer_cb),
+                         Box::into_raw(arg) as *mut c_void);
+        }
+
+        event_add(ev, &time);
+        return ev;
     }
 }
 
@@ -224,6 +295,7 @@ fn process_subscribe_command(cookie: *const c_void, iekey: String) -> String {
                     iek_type: IEKType::PubSub,
                     sub_key: None,
                     lease_time: Instant::now(),
+                    timer_ev: 0,
                     owner: None,
                     waiters: [(ptr, None)].into_iter()
                                           .map(|(k, v)| (k, HashSet::from([v])))
@@ -258,19 +330,43 @@ fn process_subscribe_command(cookie: *const c_void, iekey: String) -> String {
     return result;
 }
 
+fn process_unsubscribe_command(cookie: *const c_void, iekey: String) -> String {
+    let ptr = cookie as usize;
+    let mut iek = IEK.lock().unwrap();
+    let mut result = "SUCCESS\r\n".to_string();
+
+    match iek.get_mut(&iekey) {
+        Some(iekdata) => {
+            if iekdata.waiters.remove(&ptr).is_none() {
+                result = "NOT_SUBSCRIBED\r\n".to_string();
+            }
+        },
+        _ => result = "NOT_FOUND_CHANNEL\r\n".to_string()
+    }
+
+    return result;
+}
+
 fn process_lock_command(cookie: *const c_void, iekey: String, sub_key: Option<i32>, lease_time: f64) -> String {
     let ptr = cookie as usize;
     let mut result = String::new();
     {
         let cur_time = Instant::now();
         let exp_time = cur_time + Duration::from_millis((lease_time * 1000.0) as u64);
+        let time = timeval {
+            tv_sec: lease_time.trunc() as i64,
+            tv_usec: (lease_time.fract() * 1000000.0).abs() as i64
+        };
+
         let mut iek = IEK.lock().unwrap();
         match iek.entry(iekey.clone()) {
             Entry::Vacant(e) => {
+                let ev = update_alarm(ptr, std::ptr::null_mut(), iekey.clone(), time);
                 e.insert(IEKData {
                     iek_type: IEKType::Lock,
                     sub_key: sub_key,
                     lease_time: exp_time,
+                    timer_ev: ev as usize,
                     owner: Some(cookie as usize),
                     waiters: HashMap::new()
                 });
@@ -282,9 +378,11 @@ fn process_lock_command(cookie: *const c_void, iekey: String, sub_key: Option<i3
                     return "TYPE_MISMATCH\r\n".to_string();
                 }
                 if data.owner.is_none() || data.lease_time < cur_time {
+                    let ev = update_alarm(ptr, std::ptr::null_mut(), iekey.clone(), time);
                     data.owner = Some(ptr);
                     data.sub_key = sub_key;
                     data.lease_time = exp_time;
+                    data.timer_ev = ev as usize;
                     if let Some(h) = data.waiters.get_mut(&ptr) {
                         if h.contains(&sub_key) {
                             h.remove(&sub_key);
@@ -292,6 +390,7 @@ fn process_lock_command(cookie: *const c_void, iekey: String, sub_key: Option<i3
                     }
                     result = "OK\r\n".to_string();
                 } else if data.owner.unwrap() == ptr && data.sub_key == sub_key {
+                    data.timer_ev = update_alarm(ptr, data.timer_ev as *mut event, iekey.clone(), time) as usize;
                     data.lease_time = exp_time;
                     result = "OWNED\r\n".to_string();
                 } else {
@@ -332,6 +431,13 @@ fn process_unlock_command(cookie: *const c_void, iekey: String, sub_key: Option<
                 if iekdata.iek_type != IEKType::Lock {
                     return "TYPE_MISMATCH\r\n".to_string();
                 }
+                unsafe {
+                    if event_del(iekdata.timer_ev as *mut event) != 0 {
+                        /* event error */
+                    }
+                    event_free(iekdata.timer_ev as *mut event);
+                }
+
                 if !iekdata.owner.is_none() && iekdata.owner.unwrap() == ptr && iekdata.sub_key == sub_key {
                     iekdata.owner = None;
                     if iekdata.waiters.is_empty() {
@@ -386,7 +492,8 @@ extern "C" fn accept_command(cmd_cookie: *const c_void, cookie: *mut c_void,
             return true;
         }
     } else if cmd_cookie == &raw const IEK_SUB_DESCRIPTOR as *const _ as *const c_void {
-        if argc >= 2 && op.to_str().unwrap_or("") == "subscribe" {
+        if argc >= 2 && (op.to_str().unwrap_or("") == "subscribe" ||
+                         op.to_str().unwrap_or("") == "unsubscribe") {
             return true;
         }
     }
@@ -410,7 +517,12 @@ extern "C" fn execute_command(cmd_cookie: *const c_void, cookie: *const c_void,
     } else if cmd_cookie == &raw const IEK_PUB_DESCRIPTOR as *const _ as *const c_void {
         cmd_type = CMDType::Publish;
     } else if cmd_cookie == &raw const IEK_SUB_DESCRIPTOR as *const _ as *const c_void {
-        cmd_type = CMDType::Subscribe;
+        let first_str = unsafe { CStr::from_ptr((*argv).value) }.to_string_lossy().chars().next();
+        match first_str {
+            Some('s') => cmd_type = CMDType::Subscribe,
+            Some('u') => cmd_type = CMDType::Unsubscribe,
+            _ => cmd_type = CMDType::Unknown
+        }
     }
 
 
@@ -463,6 +575,9 @@ extern "C" fn execute_command(cmd_cookie: *const c_void, cookie: *const c_void,
                     }
                 }
                 result += "END\r\n";
+            },
+            CMDType::Unsubscribe => {
+                result = process_unsubscribe_command(cookie, iekey.clone())
             },
             _ => ()
 
